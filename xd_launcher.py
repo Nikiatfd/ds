@@ -139,6 +139,40 @@ class InstallThread(QThread):
         self.version = version
         self.install_java = install_java
 
+    def _sanitize_version_dir(self) -> None:
+        """Удаляет пустые/битые version-файлы, оставшиеся от прерванных закачек.
+
+        Если в `versions/<id>/<id>.json` лежит пустой или невалидный JSON,
+        `minecraft-launcher-lib` падает на `json.load`. Чистим — она перекачает.
+        """
+        vdir = GAME_DIR / "versions" / self.version
+        if not vdir.exists():
+            return
+        json_path = vdir / f"{self.version}.json"
+        jar_path = vdir / f"{self.version}.jar"
+        bad = False
+        if json_path.exists():
+            try:
+                text = json_path.read_text(encoding="utf-8").strip()
+                if not text:
+                    bad = True
+                else:
+                    json.loads(text)
+            except Exception:
+                bad = True
+        else:
+            bad = True
+        if bad:
+            self.progress.emit(
+                f"Обнаружен битый/пустой {json_path.name} — очищаю и перекачиваю..."
+            )
+            for p in (json_path, jar_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception as exc:
+                    self.progress.emit(f"Не смог удалить {p}: {exc}")
+
     def run(self):
         if mll is None:
             self.failed.emit("minecraft-launcher-lib не установлен. pip install -r requirements.txt")
@@ -149,8 +183,19 @@ class InstallThread(QThread):
                 "setProgress": lambda v: None,
                 "setMax": lambda v: None,
             }
+            self._sanitize_version_dir()
             self.progress.emit(f"Устанавливаю Minecraft {self.version}...")
-            mll.install.install_minecraft_version(self.version, str(GAME_DIR), callback=callback)
+            try:
+                mll.install.install_minecraft_version(
+                    self.version, str(GAME_DIR), callback=callback
+                )
+            except json.JSONDecodeError:
+                # Кто-то всё-таки оставил битый JSON — чистим ещё раз и повторяем.
+                self.progress.emit("JSON версии повреждён, чищу и пробую снова...")
+                self._sanitize_version_dir()
+                mll.install.install_minecraft_version(
+                    self.version, str(GAME_DIR), callback=callback
+                )
 
             if self.install_java:
                 try:
