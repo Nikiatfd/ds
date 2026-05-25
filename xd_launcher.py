@@ -81,9 +81,12 @@ CONFIG_FILE = APP_DIR / "config.json"
 BG_FILE = APP_DIR / "background.png"
 AUTHLIB_INJECTOR_JAR = APP_DIR / "authlib-injector.jar"
 
-# Ely.by Yggdrasil + authlib-injector endpoints
+# Ely.by Yggdrasil + authlib-injector endpoints.
+# Для -javaagent передаём короткую форму "ely.by" — authlib-injector сам
+# раскрывает её в https://authserver.ely.by/api/authlib-injector.
+# Хост https://authlib-injector.ely.by НЕ обслуживает API и отдаёт 404.
 ELY_AUTH_BASE = "https://authserver.ely.by/auth"
-ELY_AUTHLIB_URL = "https://authlib-injector.ely.by"
+ELY_AUTHLIB_URL = "ely.by"
 # Каноничный источник свежей сборки authlib-injector
 AUTHLIB_INJECTOR_META_URL = "https://authlib-injector.yushi.moe/artifact/latest.json"
 
