@@ -1,1 +1,4 @@
 PyQt6>=6.6
+minecraft-launcher-lib>=6.4
+psutil>=5.9
+requests>=2.31
