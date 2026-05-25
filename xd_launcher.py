@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import traceback
@@ -61,6 +60,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -238,8 +238,151 @@ def ensure_authlib_injector() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Modrinth API (поиск + скачивание модов/ресурспаков/шейдеров)
+# ---------------------------------------------------------------------------
+MODRINTH_API = "https://api.modrinth.com/v2"
+MODRINTH_USER_AGENT = "xd-launcher/1.0 (github.com/tembo)"
+
+# тип проекта Modrinth -> папка внутри GAME_DIR
+MODRINTH_TYPE_DIR = {
+    "mod": "mods",
+    "resourcepack": "resourcepacks",
+    "shader": "shaders",
+}
+
+
+def modrinth_search(query: str, project_type: str, game_version: str | None,
+                    limit: int = 30) -> list[dict]:
+    """Ищет проекты на Modrinth. project_type: mod/resourcepack/shader."""
+    if requests is None:
+        raise RuntimeError("Модуль requests не установлен")
+    facets: list[list[str]] = [[f"project_type:{project_type}"]]
+    if game_version:
+        facets.append([f"versions:{game_version}"])
+    params = {
+        "query": query,
+        "limit": str(limit),
+        "facets": json.dumps(facets),
+        "index": "relevance",
+    }
+    r = requests.get(
+        f"{MODRINTH_API}/search",
+        params=params,
+        headers={"User-Agent": MODRINTH_USER_AGENT},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json().get("hits", [])
+
+
+def modrinth_pick_version_file(project_slug: str, project_type: str,
+                               game_version: str | None,
+                               loader: str | None) -> tuple[str, str]:
+    """Возвращает (download_url, filename) для свежей подходящей версии.
+
+    Для модов учитывается loader (fabric/forge/quilt). Для ресурспаков
+    лоадер всегда `minecraft`. Если game_version пустой — берётся первая
+    доступная версия.
+    """
+    if requests is None:
+        raise RuntimeError("Модуль requests не установлен")
+    params: dict[str, str] = {}
+    if game_version:
+        params["game_versions"] = json.dumps([game_version])
+    if project_type == "mod" and loader:
+        params["loaders"] = json.dumps([loader])
+    elif project_type == "resourcepack":
+        params["loaders"] = json.dumps(["minecraft"])
+    r = requests.get(
+        f"{MODRINTH_API}/project/{project_slug}/version",
+        params=params,
+        headers={"User-Agent": MODRINTH_USER_AGENT},
+        timeout=20,
+    )
+    r.raise_for_status()
+    versions = r.json()
+    if not versions:
+        raise RuntimeError(
+            "Не нашёл подходящих версий: "
+            f"проверь, что для MC {game_version or '?'} и loader "
+            f"{loader or '-'} файлы существуют."
+        )
+    primary = versions[0]
+    files = primary.get("files", [])
+    file_entry = next((f for f in files if f.get("primary")), files[0] if files else None)
+    if not file_entry:
+        raise RuntimeError("У версии нет файлов для скачивания")
+    return file_entry["url"], file_entry["filename"]
+
+
+def modrinth_download(url: str, dest: Path) -> None:
+    if requests is None:
+        raise RuntimeError("Модуль requests не установлен")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(
+        url,
+        stream=True,
+        timeout=120,
+        headers={"User-Agent": MODRINTH_USER_AGENT},
+    ) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                if chunk:
+                    f.write(chunk)
+    tmp.replace(dest)
+
+
+# ---------------------------------------------------------------------------
 # Фоновые задачи (установка версии / Java / запуск)
 # ---------------------------------------------------------------------------
+class ModrinthSearchThread(QThread):
+    finished_ok = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, query: str, project_type: str, game_version: str | None):
+        super().__init__()
+        self.query = query
+        self.project_type = project_type
+        self.game_version = game_version
+
+    def run(self):
+        try:
+            hits = modrinth_search(self.query, self.project_type, self.game_version)
+            self.finished_ok.emit(hits)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ModrinthDownloadThread(QThread):
+    status = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)  # путь к скачанному файлу
+    failed = pyqtSignal(str)
+
+    def __init__(self, project: dict, game_version: str | None, loader: str | None):
+        super().__init__()
+        self.project = project
+        self.game_version = game_version
+        self.loader = loader
+
+    def run(self):
+        try:
+            slug = self.project.get("slug") or self.project.get("project_id")
+            ptype = self.project.get("project_type", "mod")
+            self.status.emit(f"Ищу подходящую версию {self.project.get('title')}...")
+            url, filename = modrinth_pick_version_file(
+                slug, ptype, self.game_version, self.loader
+            )
+            folder = MODRINTH_TYPE_DIR.get(ptype, "mods")
+            dest = GAME_DIR / folder / filename
+            self.status.emit(f"Качаю {filename} -> {folder}/")
+            modrinth_download(url, dest)
+            self.finished_ok.emit(str(dest))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class InstallThread(QThread):
     progress = pyqtSignal(str)
     finished_ok = pyqtSignal()
@@ -845,36 +988,155 @@ class XDLauncher(QMainWindow):
     # ------------------------ mods tab ---------------------------
     def _build_mods_tab(self) -> None:
         layout = QVBoxLayout(self.tab_mods)
-        info = QLabel(
-            "Сортировщик скачанных файлов: укажи папку Downloads — кнопка "
-            "разложит .jar в mods, .zip ресурспаков в resourcepacks, "
-            "а файлы шейдеров в shaders."
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        self._search_thread: ModrinthSearchThread | None = None
+        self._download_thread: ModrinthDownloadThread | None = None
 
-        row = QHBoxLayout()
-        modrinth_btn = QPushButton("🌐 Открыть Modrinth")
-        modrinth_btn.clicked.connect(lambda: webbrowser.open("https://modrinth.com"))
-        row.addWidget(modrinth_btn)
+        # верхняя строка фильтров
+        filt = QHBoxLayout()
+        self.mr_type = QComboBox()
+        self.mr_type.addItem("Моды", "mod")
+        self.mr_type.addItem("Ресурспаки", "resourcepack")
+        self.mr_type.addItem("Шейдеры", "shader")
+        filt.addWidget(QLabel("Тип:"))
+        filt.addWidget(self.mr_type)
 
-        sort_btn = QPushButton("📦 Разложить скачанные файлы")
-        sort_btn.clicked.connect(self._sort_downloads)
-        row.addWidget(sort_btn)
-        layout.addLayout(row)
+        self.mr_version = QComboBox()
+        self.mr_version.setEditable(True)
+        for v in DEFAULT_VERSIONS:
+            self.mr_version.addItem(v)
+        # Подхватим выбранную версию запуска, если есть
+        sel = self.cfg.get("selected_version")
+        if sel:
+            if self.mr_version.findText(sel) < 0:
+                self.mr_version.addItem(sel)
+            self.mr_version.setCurrentText(sel)
+        filt.addWidget(QLabel("MC:"))
+        filt.addWidget(self.mr_version)
 
-        row2 = QHBoxLayout()
-        open_mods = QPushButton("Открыть mods/")
+        self.mr_loader = QComboBox()
+        self.mr_loader.addItems(["fabric", "forge", "quilt", "neoforge", "(любой)"])
+        filt.addWidget(QLabel("Лоадер:"))
+        filt.addWidget(self.mr_loader)
+        layout.addLayout(filt)
+
+        # строка поиска
+        search_row = QHBoxLayout()
+        self.mr_query = QLineEdit()
+        self.mr_query.setPlaceholderText("название мода / ресурспака / шейдера")
+        self.mr_query.returnPressed.connect(self._modrinth_search)
+        search_row.addWidget(self.mr_query, 1)
+        search_btn = QPushButton("🔍 Найти")
+        search_btn.clicked.connect(self._modrinth_search)
+        search_row.addWidget(search_btn)
+        layout.addLayout(search_row)
+
+        # список результатов
+        self.mr_results = QListWidget()
+        self.mr_results.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        layout.addWidget(self.mr_results, 1)
+
+        # действия
+        action_row = QHBoxLayout()
+        dl_btn = QPushButton("⬇  Скачать выбранное")
+        dl_btn.clicked.connect(self._modrinth_download_selected)
+        action_row.addWidget(dl_btn)
+
+        open_page_btn = QPushButton("Открыть в браузере")
+        open_page_btn.clicked.connect(self._modrinth_open_page)
+        action_row.addWidget(open_page_btn)
+
+        action_row.addStretch(1)
+
+        open_mods = QPushButton("📁 mods/")
         open_mods.clicked.connect(lambda: self._open_subdir("mods"))
-        row2.addWidget(open_mods)
-        open_rp = QPushButton("Открыть resourcepacks/")
+        action_row.addWidget(open_mods)
+        open_rp = QPushButton("📁 resourcepacks/")
         open_rp.clicked.connect(lambda: self._open_subdir("resourcepacks"))
-        row2.addWidget(open_rp)
-        open_sh = QPushButton("Открыть shaders/")
+        action_row.addWidget(open_rp)
+        open_sh = QPushButton("📁 shaders/")
         open_sh.clicked.connect(lambda: self._open_subdir("shaders"))
-        row2.addWidget(open_sh)
-        layout.addLayout(row2)
-        layout.addStretch(1)
+        action_row.addWidget(open_sh)
+        layout.addLayout(action_row)
+
+        self.mr_status = QLabel("Введи запрос и нажми «Найти».")
+        layout.addWidget(self.mr_status)
+
+    # ---------------- Modrinth handlers ----------------
+    def _modrinth_search(self) -> None:
+        query = self.mr_query.text().strip()
+        ptype = self.mr_type.currentData()
+        version = self.mr_version.currentText().strip() or None
+        if not query:
+            self.mr_status.setText("Введи поисковый запрос.")
+            return
+        if self._search_thread and self._search_thread.isRunning():
+            self.mr_status.setText("Поиск уже идёт…")
+            return
+        self.mr_results.clear()
+        self.mr_status.setText(f"Ищу «{query}» ({ptype}, MC {version or 'любой'})…")
+        self._search_thread = ModrinthSearchThread(query, ptype, version)
+        self._search_thread.finished_ok.connect(self._modrinth_on_results)
+        self._search_thread.failed.connect(
+            lambda msg: self.mr_status.setText(f"Ошибка поиска: {msg}")
+        )
+        self._search_thread.start()
+
+    def _modrinth_on_results(self, hits: list) -> None:
+        self.mr_results.clear()
+        if not hits:
+            self.mr_status.setText("Ничего не найдено.")
+            return
+        for hit in hits:
+            title = hit.get("title", "?")
+            desc = (hit.get("description") or "").replace("\n", " ")
+            downloads = hit.get("downloads", 0)
+            author = hit.get("author", "?")
+            label = f"{title}  · by {author}  · ⬇ {downloads:,}\n    {desc[:120]}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, hit)
+            self.mr_results.addItem(item)
+        self.mr_status.setText(f"Найдено: {len(hits)}.")
+
+    def _modrinth_selected(self) -> dict | None:
+        item = self.mr_results.currentItem()
+        if not item:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _modrinth_download_selected(self) -> None:
+        hit = self._modrinth_selected()
+        if not hit:
+            self.mr_status.setText("Сначала выбери проект в списке.")
+            return
+        if self._download_thread and self._download_thread.isRunning():
+            self.mr_status.setText("Уже качаю что-то — подожди.")
+            return
+        version = self.mr_version.currentText().strip() or None
+        loader_text = self.mr_loader.currentText()
+        loader = None if loader_text.startswith("(") else loader_text
+        # для не-модов лоадер не нужен
+        if hit.get("project_type") != "mod":
+            loader = None
+        self._download_thread = ModrinthDownloadThread(hit, version, loader)
+        self._download_thread.status.connect(self.mr_status.setText)
+        self._download_thread.finished_ok.connect(self._modrinth_on_downloaded)
+        self._download_thread.failed.connect(
+            lambda msg: self.mr_status.setText(f"Ошибка: {msg}")
+        )
+        self._download_thread.start()
+
+    def _modrinth_on_downloaded(self, path: str) -> None:
+        self.mr_status.setText(f"✅ Готово: {path}")
+        QMessageBox.information(self, "Modrinth", f"Скачано в:\n{path}")
+
+    def _modrinth_open_page(self) -> None:
+        hit = self._modrinth_selected()
+        if not hit:
+            webbrowser.open("https://modrinth.com")
+            return
+        slug = hit.get("slug") or hit.get("project_id")
+        ptype = hit.get("project_type", "mod")
+        webbrowser.open(f"https://modrinth.com/{ptype}/{slug}")
 
     def _open_subdir(self, name: str) -> None:
         target = GAME_DIR / name
@@ -888,36 +1150,6 @@ class XDLauncher(QMainWindow):
             subprocess.Popen(["open", str(path)])
         else:
             subprocess.Popen(["xdg-open", str(path)])
-
-    def _sort_downloads(self) -> None:
-        src = QFileDialog.getExistingDirectory(
-            self, "Папка с загрузками", str(Path.home() / "Downloads")
-        )
-        if not src:
-            return
-        src_path = Path(src)
-        moved = 0
-        for f in src_path.iterdir():
-            if not f.is_file():
-                continue
-            name = f.name.lower()
-            target: Path | None = None
-            if name.endswith(".jar"):
-                target = GAME_DIR / "mods" / f.name
-            elif "shader" in name and (name.endswith(".zip") or name.endswith(".jar")):
-                target = GAME_DIR / "shaders" / f.name
-            elif name.endswith(".zip") and ("resource" in name or "pack" in name or "rp_" in name):
-                target = GAME_DIR / "resourcepacks" / f.name
-            elif name.endswith(".zip"):
-                target = GAME_DIR / "resourcepacks" / f.name
-            if target:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.move(str(f), str(target))
-                    moved += 1
-                except Exception as exc:
-                    self._log(f"Не смог переместить {f}: {exc}")
-        QMessageBox.information(self, "Готово", f"Перемещено файлов: {moved}")
 
     # ------------------------ log tab ----------------------------
     def _build_log_tab(self) -> None:
