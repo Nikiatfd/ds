@@ -41,6 +41,11 @@ try:
 except Exception:  # pragma: no cover - библиотека ставится из requirements
     mll = None
 
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QPixmap, QIcon, QPalette, QBrush, QFont
 from PyQt6.QtWidgets import (
@@ -74,6 +79,13 @@ GAME_DIR = APP_DIR / "minecraft"
 JAVA_DIR = APP_DIR / "runtime"
 CONFIG_FILE = APP_DIR / "config.json"
 BG_FILE = APP_DIR / "background.png"
+AUTHLIB_INJECTOR_JAR = APP_DIR / "authlib-injector.jar"
+
+# Ely.by Yggdrasil + authlib-injector endpoints
+ELY_AUTH_BASE = "https://authserver.ely.by/auth"
+ELY_AUTHLIB_URL = "https://authlib-injector.ely.by"
+# Каноничный источник свежей сборки authlib-injector
+AUTHLIB_INJECTOR_META_URL = "https://authlib-injector.yushi.moe/artifact/latest.json"
 
 DEFAULT_VERSIONS = ["1.12.2", "1.16.5", "1.20.1"]
 DEFAULT_RES_W, DEFAULT_RES_H = 925, 350
@@ -107,6 +119,18 @@ def _default_config() -> dict:
     }
 
 
+def _migrate_accounts(cfg: dict) -> None:
+    """Преобразует старый формат `accounts: ["Nick", ...]` в список словарей."""
+    new_list: list[dict] = []
+    for entry in cfg.get("accounts", []):
+        if isinstance(entry, str):
+            new_list.append({"type": "offline", "name": entry})
+        elif isinstance(entry, dict):
+            entry.setdefault("type", "offline")
+            new_list.append(entry)
+    cfg["accounts"] = new_list
+
+
 def load_config() -> dict:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     GAME_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,6 +139,7 @@ def load_config() -> dict:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             base = _default_config()
             base.update(data)
+            _migrate_accounts(base)
             return base
         except Exception:
             pass
@@ -124,6 +149,89 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Ely.by Yggdrasil + authlib-injector
+# ---------------------------------------------------------------------------
+def ely_authenticate(email: str, password: str, client_token: str | None = None) -> dict:
+    """POST authserver.ely.by/auth/authenticate. Возвращает аккаунт-словарь."""
+    if requests is None:
+        raise RuntimeError("Модуль requests не установлен")
+    payload = {
+        "username": email,
+        "password": password,
+        "clientToken": client_token or str(uuid.uuid4()),
+        "requestUser": True,
+        "agent": {"name": "Minecraft", "version": 1},
+    }
+    r = requests.post(f"{ELY_AUTH_BASE}/authenticate", json=payload, timeout=20)
+    if r.status_code != 200:
+        try:
+            data = r.json()
+            raise RuntimeError(f"{data.get('error')}: {data.get('errorMessage')}")
+        except ValueError:
+            raise RuntimeError(f"Ely.by вернул HTTP {r.status_code}")
+    data = r.json()
+    profile = data.get("selectedProfile") or {}
+    return {
+        "type": "ely",
+        "name": profile.get("name") or email,
+        "uuid": profile.get("id") or "",
+        "access_token": data.get("accessToken", ""),
+        "client_token": data.get("clientToken", ""),
+        "email": email,
+    }
+
+
+def ely_refresh(account: dict) -> bool:
+    """Пытается продлить токен. True если получилось, False если нужен ре-логин."""
+    if requests is None or not account.get("access_token"):
+        return False
+    payload = {
+        "accessToken": account["access_token"],
+        "clientToken": account.get("client_token", ""),
+    }
+    try:
+        r = requests.post(f"{ELY_AUTH_BASE}/refresh", json=payload, timeout=20)
+        if r.status_code != 200:
+            return False
+        data = r.json()
+        account["access_token"] = data.get("accessToken", account["access_token"])
+        account["client_token"] = data.get("clientToken", account.get("client_token", ""))
+        profile = data.get("selectedProfile") or {}
+        if profile.get("name"):
+            account["name"] = profile["name"]
+        if profile.get("id"):
+            account["uuid"] = profile["id"]
+        return True
+    except Exception:
+        return False
+
+
+def ensure_authlib_injector() -> Path:
+    """Скачивает authlib-injector.jar в APP_DIR, если его ещё нет.
+
+    Возвращает путь к .jar. Бросает RuntimeError при провале.
+    """
+    if AUTHLIB_INJECTOR_JAR.exists() and AUTHLIB_INJECTOR_JAR.stat().st_size > 50_000:
+        return AUTHLIB_INJECTOR_JAR
+    if requests is None:
+        raise RuntimeError("Нужен модуль requests для скачивания authlib-injector")
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    meta = requests.get(AUTHLIB_INJECTOR_META_URL, timeout=20).json()
+    url = meta.get("download_url")
+    if not url:
+        raise RuntimeError("Не нашёл download_url в метаданных authlib-injector")
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        tmp = AUTHLIB_INJECTOR_JAR.with_suffix(".part")
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                if chunk:
+                    f.write(chunk)
+        tmp.replace(AUTHLIB_INJECTOR_JAR)
+    return AUTHLIB_INJECTOR_JAR
 
 
 # ---------------------------------------------------------------------------
@@ -245,69 +353,164 @@ class LaunchThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Диалог менеджера аккаунтов
+# Диалоги аккаунтов
 # ---------------------------------------------------------------------------
+class ElyLoginDialog(QDialog):
+    """Диалог логина через authserver.ely.by."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Войти через Ely.by")
+        self.account: dict | None = None
+
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("email или ник, зарегистрированный на ely.by")
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pass_edit.setPlaceholderText("пароль")
+
+        login_btn = QPushButton("Войти")
+        cancel_btn = QPushButton("Отмена")
+        login_btn.clicked.connect(self._do_login)
+        cancel_btn.clicked.connect(self.reject)
+
+        info = QLabel(
+            'Регистрация: <a href="https://account.ely.by/register">account.ely.by/register</a>.<br>'
+            "После входа лаунчер будет автоматически подгружать "
+            "<code>authlib-injector</code> и заходить на лицензионные серверы под этим ником."
+        )
+        info.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Логин:", self.email_edit)
+        form.addRow("Пароль:", self.pass_edit)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(login_btn)
+        btns.addWidget(cancel_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addLayout(form)
+        layout.addLayout(btns)
+
+    def _do_login(self) -> None:
+        email = self.email_edit.text().strip()
+        password = self.pass_edit.text()
+        if not email or not password:
+            QMessageBox.warning(self, "Ely.by", "Введи логин и пароль.")
+            return
+        try:
+            self.account = ely_authenticate(email, password)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ely.by", f"Ошибка входа:\n{exc}")
+            return
+        self.accept()
+
+
 class AccountDialog(QDialog):
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.setWindowTitle("Аккаунты")
-        self.resize(380, 320)
+        self.resize(440, 360)
 
         self.list = QListWidget()
-        for nick in cfg.get("accounts", []):
-            self.list.addItem(nick)
+        self._reload_list()
 
-        add_btn = QPushButton("Добавить ник")
+        add_off_btn = QPushButton("+ Оффлайн ник")
+        add_ely_btn = QPushButton("+ Ely.by")
         del_btn = QPushButton("Удалить")
         set_btn = QPushButton("Сделать активным")
         close_btn = QPushButton("Закрыть")
 
-        add_btn.clicked.connect(self.add)
+        add_off_btn.clicked.connect(self.add_offline)
+        add_ely_btn.clicked.connect(self.add_ely)
         del_btn.clicked.connect(self.remove)
         set_btn.clicked.connect(self.set_active)
         close_btn.clicked.connect(self.accept)
 
-        btns = QHBoxLayout()
-        btns.addWidget(add_btn)
-        btns.addWidget(del_btn)
-        btns.addWidget(set_btn)
-        btns.addWidget(close_btn)
+        btns_top = QHBoxLayout()
+        btns_top.addWidget(add_off_btn)
+        btns_top.addWidget(add_ely_btn)
+        btns_bot = QHBoxLayout()
+        btns_bot.addWidget(set_btn)
+        btns_bot.addWidget(del_btn)
+        btns_bot.addStretch(1)
+        btns_bot.addWidget(close_btn)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Оффлайн-аккаунты (никнеймы):"))
+        layout.addWidget(QLabel("Аккаунты для запуска Minecraft:"))
         layout.addWidget(self.list)
-        layout.addLayout(btns)
+        layout.addLayout(btns_top)
+        layout.addLayout(btns_bot)
 
-    def add(self):
+    def _reload_list(self) -> None:
+        self.list.clear()
+        for acc in self.cfg.get("accounts", []):
+            kind = acc.get("type", "offline")
+            badge = "🌐 Ely.by" if kind == "ely" else "📴 offline"
+            current = " ★" if acc.get("name") == self.cfg.get("current_account") else ""
+            self.list.addItem(f"{badge}  {acc.get('name', '?')}{current}")
+
+    def _names(self) -> list[str]:
+        return [a.get("name", "") for a in self.cfg.get("accounts", [])]
+
+    def add_offline(self) -> None:
         nick, ok = QInputDialog.getText(self, "Новый ник", "Введите никнейм:")
         nick = nick.strip()
-        if ok and nick:
-            if nick not in self.cfg["accounts"]:
-                self.cfg["accounts"].append(nick)
-                self.list.addItem(nick)
-                if not self.cfg.get("current_account"):
-                    self.cfg["current_account"] = nick
+        if not (ok and nick):
+            return
+        if nick in self._names():
+            QMessageBox.information(self, "Аккаунты", "Такой ник уже есть.")
+            return
+        self.cfg["accounts"].append({"type": "offline", "name": nick})
+        if not self.cfg.get("current_account"):
+            self.cfg["current_account"] = nick
+        self._reload_list()
 
-    def remove(self):
+    def add_ely(self) -> None:
+        dlg = ElyLoginDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.account:
+            return
+        acc = dlg.account
+        # если уже есть такой ник — заменим, обновив токен
+        existing = [i for i, a in enumerate(self.cfg["accounts"]) if a.get("name") == acc["name"]]
+        if existing:
+            self.cfg["accounts"][existing[0]] = acc
+        else:
+            self.cfg["accounts"].append(acc)
+        self.cfg["current_account"] = acc["name"]
+        self._reload_list()
+        QMessageBox.information(self, "Ely.by", f"Вошёл как {acc['name']}")
+
+    def remove(self) -> None:
         row = self.list.currentRow()
         if row < 0:
             return
-        nick = self.list.item(row).text()
-        self.cfg["accounts"].remove(nick)
-        self.list.takeItem(row)
-        if self.cfg.get("current_account") == nick:
+        acc = self.cfg["accounts"][row]
+        self.cfg["accounts"].pop(row)
+        if self.cfg.get("current_account") == acc.get("name"):
             self.cfg["current_account"] = (
-                self.cfg["accounts"][0] if self.cfg["accounts"] else ""
+                self.cfg["accounts"][0]["name"] if self.cfg["accounts"] else ""
             )
+        self._reload_list()
 
-    def set_active(self):
+    def set_active(self) -> None:
         row = self.list.currentRow()
         if row < 0:
             return
-        nick = self.list.item(row).text()
-        self.cfg["current_account"] = nick
-        QMessageBox.information(self, "Активный аккаунт", f"Теперь играем за: {nick}")
+        acc = self.cfg["accounts"][row]
+        self.cfg["current_account"] = acc.get("name", "")
+        self._reload_list()
+        QMessageBox.information(
+            self,
+            "Активный аккаунт",
+            f"Теперь играем за: {acc.get('name')} "
+            f"({'Ely.by' if acc.get('type') == 'ely' else 'offline'})",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -449,16 +652,30 @@ class XDLauncher(QMainWindow):
 
     def _refresh_accounts(self) -> None:
         self.account_combo.clear()
-        for nick in self.cfg.get("accounts", []):
-            self.account_combo.addItem(nick)
+        for acc in self.cfg.get("accounts", []):
+            label = acc.get("name", "?")
+            if acc.get("type") == "ely":
+                label = f"{label}  [Ely.by]"
+            self.account_combo.addItem(label, userData=acc.get("name", ""))
         current = self.cfg.get("current_account")
         if current:
-            self.account_combo.setCurrentText(current)
+            for i in range(self.account_combo.count()):
+                if self.account_combo.itemData(i) == current:
+                    self.account_combo.setCurrentIndex(i)
+                    break
 
-    def _on_account_changed(self, nick: str) -> None:
-        if nick:
-            self.cfg["current_account"] = nick
+    def _on_account_changed(self, _label: str) -> None:
+        name = self.account_combo.currentData()
+        if name:
+            self.cfg["current_account"] = name
             save_config(self.cfg)
+
+    def _current_account(self) -> dict | None:
+        name = self.cfg.get("current_account")
+        for acc in self.cfg.get("accounts", []):
+            if acc.get("name") == name:
+                return acc
+        return None
 
     def _open_accounts(self) -> None:
         dlg = AccountDialog(self.cfg, self)
@@ -776,10 +993,32 @@ class XDLauncher(QMainWindow):
     def _launch(self, version: str) -> None:
         if mll is None:
             return
-        nick = self.cfg.get("current_account") or "Player"
+        account = self._current_account() or {"type": "offline", "name": "Player"}
+        nick = account.get("name") or "Player"
         ram_mb = int(self.cfg.get("ram_mb", 2048))
 
         jvm_args: list[str] = [f"-Xmx{ram_mb}M", f"-Xms{min(ram_mb, 512)}M"]
+
+        # Ely.by — нужен -javaagent c authlib-injector
+        if account.get("type") == "ely":
+            try:
+                jar = ensure_authlib_injector()
+                self._log(f"Использую authlib-injector: {jar}")
+                jvm_args.insert(0, f"-javaagent:{jar}={ELY_AUTHLIB_URL}")
+            except Exception as exc:
+                self._log(f"[ОШИБКА] не смог получить authlib-injector: {exc}")
+                self.status.setText("Не смог скачать authlib-injector.")
+                self.play_btn.setEnabled(True)
+                return
+            # Освежаем токен на всякий случай
+            if ely_refresh(account):
+                save_config(self.cfg)
+            access_token = account.get("access_token", "0") or "0"
+            user_uuid = account.get("uuid") or str(uuid.uuid3(uuid.NAMESPACE_DNS, nick))
+        else:
+            access_token = "0"
+            user_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, nick))
+
         if self.cfg.get("extra_optimized"):
             jvm_args.extend(OPTIMIZED_JVM_ARGS.split())
         extra = (self.cfg.get("jvm_args") or "").strip()
@@ -788,8 +1027,8 @@ class XDLauncher(QMainWindow):
 
         options = {
             "username": nick,
-            "uuid": str(uuid.uuid3(uuid.NAMESPACE_DNS, nick)),
-            "token": "0",
+            "uuid": user_uuid,
+            "token": access_token,
             "jvmArguments": jvm_args,
             "launcherName": APP_NAME,
             "launcherVersion": "1.0",
